@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+import argh
+import boto3
+import sys
+import re
+import subprocess
+
+@argh.arg('--param',
+          dest='PARAM',
+          help='Name of SSM parameter to read')
+@argh.arg('--region',
+          dest='AWS_REGION',
+          metavar='AWS_REGION',
+          help='AWS region in which the ECS cluster resides')
+@argh.arg('--profile',
+          dest='AWS_PROFILE',
+          metavar='AWS_PROFILE',
+          help='AWS profile to use')
+@argh.arg('--value',
+          dest='VALUE',
+          metavar='VALUE',
+          help='Value to compare against')
+@argh.arg('--condition',
+          dest='CONDITION',
+          help='Condition to compare value with',
+          default='equals')
+@argh.arg('--not',
+          dest='NOT',
+          help='Negate the condition',
+          default=False,
+          action='store_true')
+@argh.arg('--with-decryption',
+          dest='WITH_DECRYPTION',
+          help='Decrypt value before comparison',
+          default=False,
+          action='store_true')
+@argh.arg('--set-on-success',
+          dest='SET_ON_SUCESS',
+          help='Value to set the SSM parameter to on success')
+@argh.arg('--default-value',
+          dest='DEFAULT',
+          help='Value to use if SSM paramter is missing')
+@argh.arg('--delete-on-success',
+          dest='DELETE_ON_SUCCESS',
+          help='Delete the SSM paramter if the command returns successfully',
+          default=False,
+          action='store_true')
+@argh.arg('--verbose',
+          dest='VERBOSE',
+          help='Output debug information',
+          default=False)
+@argh.arg('COMMAND',
+          nargs='*',
+          metavar='COMMAND',
+          help='Command to run')
+
+def run_if(**kwargs):
+	"Runs an arbitrary command if an AWS SSM parameter meets a given condition."
+
+	def log(msg):
+		if kwargs['VERBOSE']:
+			print(msg)
+
+	session = boto3.session.Session(profile_name=kwargs['AWS_PROFILE'], region_name=kwargs['AWS_REGION'])
+	client = session.client('ssm')
+
+	# Get the parameter. If not found and a default is specified, use that value instead.
+	# Otherwise pass up the ParameterNotFound exception
+	try:
+		log("Reading param '{0}'...".format(kwargs['PARAM']))
+		result = client.get_parameter(Name=kwargs['PARAM'], WithDecryption=kwargs['WITH_DECRYPTION'])
+		value = result.get('Parameter',{}).get('Value')
+		log("Read param '{0}'. Value='{1}'".format(kwargs['PARAM'], value))
+		paramExists = True
+	except client.exceptions.ParameterNotFound as ex:
+		paramExists = False
+		if kwargs['DEFAULT'] != None:
+			value = kwargs['DEFAULT']
+			log("Param '{0}' not found. Using default '{1}'".format(kwargs['PARAM'], value))
+		else:
+			raise ex
+
+	condition = kwargs['CONDITION']
+	result = False	
+	if condition == "equals":
+		result = value == kwargs['VALUE']
+	elif condition == "greater":
+		result = value > kwargs['VALUE']
+	elif condition == "less":
+		result = value < kwargs['VALUE']
+	elif condition == "greaterorequal":
+		result = value >= kwargs['VALUE']
+	elif condition == "lessorequal":
+		result = value <= kwargs['VALUE']
+	elif condition == "match":
+		result = re.match(kwargs['VALUE'], value)
+	else:
+		raise Error("Unknown condition '{0}'".format(condition))
+
+	if kwargs['NOT']:
+		result = not result
+
+	if result:
+		log("Condition '{0}'{1}{2} '{3}' is satisfied. Running command: {4}".format(value, " not " if kwargs['NOT'] else " ", condition, kwargs['VALUE'], " ".join(kwargs['COMMAND'])))
+		child = subprocess.Popen(kwargs['COMMAND'])
+		returnCode = child.wait()
+		log("Command returned exit code: {0}".format(returnCode))
+
+		if returnCode == 0:
+			if kwargs['DELETE_ON_SUCCESS'] and paramExists:
+				log("Deleting parameter '{0}'".format(kwargs['PARAM']))
+				client.delete_parameter(Name=kwargs['PARAM'])
+			elif kwargs['SET_ON_SUCESS'] != None:
+				log("Setting parameter '{0}' to '{1}'".format(kwargs['PARAM'], kwargs['SET_ON_SUCESS']))
+				client.put_parameter(Name=kwargs['PARAM'], Value=kwargs['SET_ON_SUCESS'], Overwrite=True, Type="SecureString" if kwargs['WITH_DECRYPTION'] else "String")
+
+		exit(returnCode)
+	else:
+		log("Condition '{0}'{1}{2} '{3}' is not satisfied. Skipping command.".format(value, " not " if kwargs['NOT'] else " ", condition, kwargs['VALUE']))
+		exit(0)
+
+if __name__ == '__main__':
+	argh.dispatch_command(run_if)
